@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Energy Incremental - Rise to 1.00e100</title>
+    <title>Energy Incremental</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;600;700&display=swap');
@@ -506,7 +506,7 @@
                     <path d="M13 2L4 14H11L10 22L20 9H13L13 2Z" fill="var(--yellow)"/>
                 </svg>
                 <h1 class="font-display text-xl font-bold tracking-wide text-[var(--text)]">Energy Incremental</h1>
-                <span class="text-xs text-[var(--text-dim)] font-mono bg-[var(--panel-raised)] px-2 py-0.5 rounded border border-[var(--line)]">v0.7.0</span>
+                <span class="text-xs text-[var(--text-dim)] font-mono bg-[var(--panel-raised)] px-2 py-0.5 rounded border border-[var(--line)]">v0.5.9</span>
             </div>
 
             <div class="hero-panel inline-flex flex-col items-center justify-center gap-1 px-10 py-5 mb-6">
@@ -939,7 +939,7 @@
             wattCatalyst: {
                 id: 'wattCatalyst',
                 name: "Watt Overdrive",
-                desc: "Increases the passive boost of each unspent Watt by +3% (Base 5%).",
+                desc: "Increases the passive boost of each unspent Watt by +3% (Base 1%).",
                 maxLevel: 10,
                 costFunc: (lvl) => Math.floor(2 * Math.pow(2.4, lvl))
             },
@@ -1105,7 +1105,7 @@
         // ===== Big Number system =====
         // JavaScript numbers are IEEE-754 doubles, which top out at Number.MAX_VALUE =~
         // 1.7976931348623157e308 - anything at or beyond that becomes Infinity. To genuinely
-        // support values up to 1.00e1000, energy/generator-amount/cost values are represented
+        // support values up to 1.00e1500, energy/generator-amount/cost values are represented
         // as a {mantissa, exponent} pair instead (mantissa always in [1,10), exponent an
         // ordinary integer with no practical ceiling) - the same technique used by virtually
         // every incremental game that goes beyond double range (e.g. break_infinity.js).
@@ -1257,9 +1257,9 @@
         Big.ZERO = Object.freeze(new Big(0, 0));
         Big.ONE = Object.freeze(new Big(1, 0));
 
-        // Safeguard/ultimate cap. With the Big number system above, 1.00e1000 is exact and
+        // Safeguard/ultimate cap. With the Big number system above, 1.00e1500 is exact and
         // requires no compromise the way the old double-based MAX_VAL did.
-        const MAX_VAL = new Big(1, 1000);
+        const MAX_VAL = new Big(1, 1500);
 
         const DEFAULT_STATE = {
             energy: 10,
@@ -1277,6 +1277,7 @@
             lastTick: Date.now(),
             gens: Array.from({ length: 8 }, () => ({ amount: 0, bought: 0 })), // amount revived to Big below
             autoBuyers: Array.from({ length: 8 }, () => 0),
+            autoBuyerEnabled: Array.from({ length: 8 }, () => true),
             upgrades: {
                 efficiency: 0,
                 synergy: 0,
@@ -1722,11 +1723,31 @@
             return mult;
         }
 
-        // Every factor here (Watt Surge, the Watt production bonus, achievement bonuses) stays
-        // comfortably within plain-double range even at the new 1.00e1000 energy cap - only the
-        // Synergy term in getPerGenMultiplier() above needs true Big math. Wrapped in Big.from()
-        // at the end purely so it composes uniformly with getPerGenMultiplier() wherever the two
-        // get multiplied together.
+        // The Watt production bonus used to be flat linear in Watts (1 + watts*pct), which
+        // meant doubling your banked Watts only ever doubled this bonus - a fixed, ever-
+        // diminishing-in-relative-terms payoff no matter how deep into the game you were.
+        // This instead raises (1 + watts*pct) to an exponent that itself grows (slowly) with
+        // how many orders of magnitude of Watts you've banked, so the curve keeps steepening
+        // the bigger your number gets instead of settling into a flat rate. Computed entirely
+        // via Big/log-space math (Big.pow does the exponentiation as log10*exponent, then
+        // converts back) since a plain-number Watts value raised to a >1 exponent can overflow
+        // straight to Infinity long before it ever reaches Big.from() - exactly the kind of
+        // silent blowup the Big number system exists to avoid.
+        function getWattProductionBonus() {
+            let wattBonusPct = 0.01 + (0.03 * (state.upgrades.wattCatalyst || 0));
+            let watts = Math.max(0, state.watts || 0);
+            if (watts <= 0) return Big.ONE;
+
+            let base = Big.fromNumber(watts).mul(wattBonusPct).add(1); // 1 + watts*pct, as a Big
+            let exponent = 1 + 0.15 * Math.max(0, base.log10());
+            return base.pow(exponent);
+        }
+
+        // Watt Surge and achievement bonuses stay comfortably within plain-double range even
+        // at the new 1.00e1500 energy cap - only the Watt production bonus above (see
+        // getWattProductionBonus) and the Synergy term in getPerGenMultiplier() need true Big
+        // math. The plain-double part is combined into a Big only once, at the very end, so it
+        // composes uniformly with getPerGenMultiplier() wherever the two get multiplied together.
         function getGlobalProductionMultiplier() {
             let mult = 1;
 
@@ -1735,13 +1756,10 @@
                 mult *= Math.pow(100, surgeLvl);
             }
 
-            let wattBonusPct = 0.05 + (0.03 * (state.upgrades.wattCatalyst || 0));
-            mult *= (1 + (state.watts * wattBonusPct));
-
             mult *= getAchievementBonusMultiplier();
 
             if (isNaN(mult) || !isFinite(mult)) mult = 1;
-            return Big.from(mult);
+            return Big.from(mult).mul(getWattProductionBonus());
         }
 
         // Combined effective multiplier for a single generator, for display purposes
@@ -1813,8 +1831,14 @@
         function getPrestigeWattsGain() {
             if (state.energy.lt(1e100)) return 0;
             let logE = state.energy.log10();
-            let gain = Math.pow(10, (logE - 100) / 10);
-            
+
+            // Quadratic in the "excess" order-of-magnitude count past the 1e100 threshold -
+            // tuned so ~1.00e600 Energy (excess=500) nets roughly 500K Watts per reset, putting
+            // the 1,000,000-Watt Gigawatt-prestige threshold within a couple of resets around
+            // that point instead of 100+ resets of ~10K Watts each.
+            let excess = Math.max(0, logE - 100);
+            let gain = 2 * Math.pow(excess, 2);
+
             let wattBoostLvl = state.gigaUpgrades.wattBoost || 0;
             if (wattBoostLvl > 0) {
                 gain *= Math.pow(2.0, wattBoostLvl);
@@ -1861,7 +1885,9 @@
             
             state.watts = 0;
             state.upgrades = { efficiency: 0, synergy: 0, timeWarp: 0, wattCatalyst: 0, quantumCore: 0 };
-            state.autoBuyers = Array.from({ length: 8 }, () => 0);
+            // Auto-buyers (and their on/off toggles) are intentionally NOT reset here - once
+            // bought, they're permanent and carry through every Gigawatt prestige from now on,
+            // even though the Watts that paid for them do get reset above.
 
             renderGenerators();
             renderUpgrades();
@@ -1919,13 +1945,28 @@
             }
         }
 
+        // Flips the per-generator on/off switch shown beside its Buy buttons once that
+        // generator's auto-buyer has actually been purchased. Purely a pause/resume toggle -
+        // it never affects the owned auto-buyer level itself, so re-enabling picks back up
+        // at whatever level was already bought.
+        function toggleAutoBuyer(index) {
+            if (!(state.autoBuyers[index] > 0)) return;
+            if (!state.autoBuyerEnabled) state.autoBuyerEnabled = Array.from({ length: 8 }, () => true);
+            let currentlyEnabled = state.autoBuyerEnabled[index] !== false;
+            state.autoBuyerEnabled[index] = !currentlyEnabled;
+            renderGenerators();
+        }
+
         // Called once per production tick (and once per offline-calc chunk) so owned
         // auto-buyers keep working identically whether the tab is open, the game is
         // backgrounded, or the player is offline. Mirrors buyMaxAll()'s highest-tier-first
         // order so automated purchases behave the same way a manual "Buy Max All" click would.
+        // Skips any generator whose toggle (see toggleAutoBuyer) has been switched off, even
+        // though its auto-buyer level is still owned.
         function runAutoBuyers() {
             for (let i = 7; i >= 0; i--) {
-                if ((state.autoBuyers[i] || 0) > 0) {
+                let enabled = !state.autoBuyerEnabled || state.autoBuyerEnabled[i] !== false;
+                if ((state.autoBuyers[i] || 0) > 0 && enabled) {
                     buyMaxGen(i);
                 }
             }
@@ -2030,12 +2071,15 @@
                             <span class="text-xs ml-1">(Bought: <span id="gen-bought-${i}">0</span>)</span>
                         </div>
                     </div>
-                    <div class="flex gap-2 w-full md:w-auto">
+                    <div class="flex gap-2 w-full md:w-auto items-center">
                         <button onclick="buyGen(${i})" id="btn-buy-${i}" class="btn-buy btn-ghost flex-[3] md:flex-none rounded px-4 py-2 text-sm font-bold text-center min-w-[120px]">
                             Buy 1<br><span class="text-xs text-[var(--yellow)] number-font" id="gen-cost-${i}">0</span><br><span class="text-[10px] text-[var(--text-dim)] normal-case" id="gen-eta-${i}"></span>
                         </button>
                         <button onclick="buyMaxGen(${i}); renderGenerators();" id="btn-buy-max-${i}" class="btn-buy btn-primary flex-1 md:flex-none rounded px-4 py-2 text-sm min-w-[80px]">
                             Max
+                        </button>
+                        <button onclick="toggleAutoBuyer(${i})" id="btn-auto-toggle-${i}" title="Toggle auto-buyer" class="hidden flex-shrink-0 rounded-full w-11 h-6 relative border border-[var(--line)] transition-colors" style="background: var(--panel-raised);">
+                            <span id="auto-toggle-knob-${i}" class="absolute top-0.5 left-0.5 w-4 h-4 rounded-full transition-transform" style="background: var(--text-dim);"></span>
                         </button>
                     </div>
                 `;
@@ -2155,8 +2199,22 @@
                 let autoBadge = document.getElementById(`gen-auto-badge-${i}`);
                 let btnBuy = document.getElementById(`btn-buy-${i}`);
                 let btnMax = document.getElementById(`btn-buy-max-${i}`);
+                let btnAutoToggle = document.getElementById(`btn-auto-toggle-${i}`);
+                let autoToggleKnob = document.getElementById(`auto-toggle-knob-${i}`);
 
-                if (autoBadge) autoBadge.classList.toggle('hidden', !((state.autoBuyers[i] || 0) > 0));
+                let hasAutoBuyer = (state.autoBuyers[i] || 0) > 0;
+                if (autoBadge) autoBadge.classList.toggle('hidden', !hasAutoBuyer);
+
+                if (btnAutoToggle) {
+                    btnAutoToggle.classList.toggle('hidden', !hasAutoBuyer);
+                    let autoEnabled = !state.autoBuyerEnabled || state.autoBuyerEnabled[i] !== false;
+                    btnAutoToggle.style.background = autoEnabled ? 'var(--yellow)' : 'var(--panel-raised)';
+                    btnAutoToggle.title = autoEnabled ? 'Auto-buyer ON - click to pause' : 'Auto-buyer OFF - click to resume';
+                    if (autoToggleKnob) {
+                        autoToggleKnob.style.transform = autoEnabled ? 'translateX(20px)' : 'translateX(0)';
+                        autoToggleKnob.style.background = autoEnabled ? '#0a0900' : 'var(--text-dim)';
+                    }
+                }
 
                 if (amtEl) amtEl.innerText = formatNumber(state.gens[i].amount);
                 if (boughtEl) boughtEl.innerText = state.gens[i].bought;
@@ -2509,8 +2567,10 @@
                 DOM.btnPrestigeGiga.classList.remove('animate-pulse');
             }
 
-            let wattBonusPct = 0.05 + (0.03 * (state.upgrades.wattCatalyst || 0));
-            DOM.wattsBoost.innerText = formatNumber(state.watts * (wattBonusPct * 100)) + '%';
+            // Reflects the actual (now superlinear) bonus from getWattProductionBonus, not the
+            // old flat linear estimate - shown as a percentage over the 1x baseline.
+            let wattBoostPct = getWattProductionBonus().sub(1).mul(100);
+            DOM.wattsBoost.innerText = formatNumber(wattBoostPct) + '%';
 
             if (!DOM.tabs.contentGens.classList.contains('hidden')) {
                 renderGenerators(); 
@@ -3031,6 +3091,15 @@
             if (parsed.autoBuyers && Array.isArray(parsed.autoBuyers)) {
                 for (let i = 0; i < 8; i++) {
                     state.autoBuyers[i] = sanitizeNumber(parsed.autoBuyers[i], 0);
+                }
+            }
+
+            // Defaults to enabled (true) so existing saves - which predate this toggle -
+            // keep their auto-buyers running exactly as before instead of silently pausing.
+            state.autoBuyerEnabled = Array.from({ length: 8 }, () => true);
+            if (parsed.autoBuyerEnabled && Array.isArray(parsed.autoBuyerEnabled)) {
+                for (let i = 0; i < 8; i++) {
+                    state.autoBuyerEnabled[i] = parsed.autoBuyerEnabled[i] !== false;
                 }
             }
 
